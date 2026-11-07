@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  brand-integrity:
+    name: Brand integrity (official logo unchanged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-brand.sh
+
+  contract:
+    name: bila-core (unit tests + wasm build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/bila-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (same version as rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/bila-core
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Install cargo-near
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/near/cargo-near/releases/latest/download/cargo-near-installer.sh | sh
+
+      - name: Build wasm with cargo-near (ABI skipped in M1)
+        run: cargo near build non-reproducible-wasm --no-abi
+
+      - name: Confirm wasm artifact exists
+        run: |
+          WASM="$(find target -type f -name 'bila_core.wasm' | head -n 1)"
+          test -n "$WASM"
+          ls -l "$WASM"
+
+      - name: Format and lint (advisory in M1, blocking from M2)
+        continue-on-error: true
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
