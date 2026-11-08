@@ -1,0 +1,98 @@
+name: Unpack bundle
+
+# Upload a zip to the repository root on github.com (Add file > Upload files).
+# This workflow unpacks it into the repo, deletes the zip, commits the result and
+# starts CI on the new commit. No terminal needed.
+#
+# Limits:
+# - Only zips ADDED at the repository root by the triggering push are unpacked.
+# - GitHub's built-in token cannot change files under .github/workflows, so those
+#   entries are skipped (with a warning) and must be updated by hand.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.zip"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: unpack-bundle
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    name: Unpack uploaded zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Unpack, commit and push
+        id: unpack
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! ADDED="$(git -c core.quotePath=false diff --name-only --diff-filter=A "$BEFORE" "$AFTER" -- ':(glob)*.zip')"; then
+            echo "::error::Could not compare commits $BEFORE..$AFTER."
+            exit 1
+          fi
+          if [ -z "$ADDED" ]; then
+            echo "No new root-level zip in this push. Nothing to do."
+            exit 0
+          fi
+
+          UNPACKED=""
+          while IFS= read -r z; do
+            [ -n "$z" ] || continue
+            if [ ! -f "$z" ]; then
+              echo "Skipping $z (no longer in the repo)."
+              continue
+            fi
+            echo "::group::Unpacking $z"
+            NAMES="$(unzip -Z1 "$z")"
+            echo "$NAMES"
+            if grep -Eq '(^/|(^|/)\.\.(/|$)|(^|/)\.git(/|$))' <<< "$NAMES"; then
+              echo "::error::Refusing $z: it contains an absolute path, a parent-directory path or a .git path."
+              exit 1
+            fi
+            if grep -Eq '^\.github/workflows/' <<< "$NAMES"; then
+              echo "::warning::$z contains workflow files. The built-in token cannot write them, so they were skipped. Update them by hand on github.com."
+            fi
+            rc=0
+            unzip -o -q "$z" -x '.github/workflows/*' || rc=$?
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ] && [ "$rc" -ne 11 ]; then
+              echo "::error::unzip failed on $z (exit code $rc)."
+              exit 1
+            fi
+            UNPACKED="$UNPACKED $z"
+            echo "::endgroup::"
+          done <<< "$ADDED"
+
+          # Remove every zip left at the repository root so bundles never pile up.
+          git rm -q -f --ignore-unmatch -- ':(glob)*.zip'
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed after unpacking."
+            exit 0
+          fi
+          git commit -q -m "chore: unpack bundle${UNPACKED}"
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Start CI on the unpacked commit
+        if: steps.unpack.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref main
